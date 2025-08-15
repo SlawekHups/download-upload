@@ -1,0 +1,44 @@
+[Unit]
+Description=File Uploader - Bezpieczne narzędzie webowe do zarządzania plikami
+Documentation=https://github.com/user/fileuploader
+After=network.target
+
+[Service]
+Type=notify
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/fileuploader
+Environment="PATH=/opt/fileuploader/venv/bin"
+Environment="ADMIN_PASSWORD=twoje_haslo_admin"
+Environment="SECRET_KEY=twoj_tajny_klucz_sesji"
+Environment="UPLOAD_ROOT=/opt/fileuploader/uploads"
+Environment="MAX_CONTENT_LENGTH=512MB"
+ExecStart=/opt/fileuploader/venv/bin/gunicorn --config /opt/fileuploader/deploy/gunicorn.conf.py app:app
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=5
+PrivateTmp=true
+Restart=always
+RestartSec=10
+
+# Security
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/fileuploader/uploads
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=1024
+
+[Install]
+WantedBy=multi-user.target
