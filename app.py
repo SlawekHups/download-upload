@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 """
-Prosty File Uploader - wszystko w jednym pliku
+Prosty serwer HTTP do upload/download plików - bez zewnętrznych zależności
+Używa tylko standardowych bibliotek Pythona 3
 """
-import os
-import re
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
 
-from flask import Flask, request, session, redirect, url_for, render_template_string, flash, abort, jsonify, send_file
-from itsdangerous import TimestampSigner, BadSignature, SignatureExpired
-from werkzeug.middleware.proxy_fix import ProxyFix
-from werkzeug.utils import secure_filename
+import os
+import sys
+import json
+import base64
+import hashlib
+import hmac
+import time
+import urllib.parse
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 # Konfiguracja z ENV
-def get_required_env(key: str) -> str:
-    """Pobiera wymaganą zmienną środowiskową"""
-    value = os.environ.get(key)
-    if not value:
-        print(f"BŁĄD: Wymagana zmienna środowiskowa {key} nie jest ustawiona")
-        print(f"Ustaw {key} przed uruchomieniem aplikacji")
-        exit(1)
+def get_required_env(name, default=None):
+    value = os.environ.get(name, default)
+    if value is None:
+        print(f"BŁĄD: Wymagana zmienna środowiskowa {name} nie jest ustawiona", file=sys.stderr)
+        sys.exit(1)
     return value
 
-def parse_size(size_str: str) -> int:
-    """Konwertuje rozmiar z stringa na bajty (np. '512MB' -> 536870912)"""
-    size_str = size_str.upper().strip()
+def parse_size(size_str):
+    """Konwertuje string rozmiaru (np. '512MB') na bajty"""
+    size_str = size_str.upper()
     if size_str.endswith('KB'):
         return int(size_str[:-2]) * 1024
     elif size_str.endswith('MB'):
@@ -35,437 +36,537 @@ def parse_size(size_str: str) -> int:
     else:
         return int(size_str)
 
-# Pobieranie zmiennych środowiskowych
+# Konfiguracja
 ADMIN_PASSWORD = get_required_env('ADMIN_PASSWORD')
 SECRET_KEY = get_required_env('SECRET_KEY')
 UPLOAD_ROOT = os.environ.get('UPLOAD_ROOT', './uploads')
 MAX_CONTENT_LENGTH = parse_size(os.environ.get('MAX_CONTENT_LENGTH', '512MB'))
 
-# Tworzenie katalogu uploads
-upload_path = Path(UPLOAD_ROOT).resolve()
+# Tworzenie katalogu upload
+upload_path = Path(UPLOAD_ROOT)
 upload_path.mkdir(mode=0o700, exist_ok=True)
 
-# Inicjalizacja Flask
-app = Flask(__name__)
-app.config.update(
-    SECRET_KEY=SECRET_KEY,
-    MAX_CONTENT_LENGTH=MAX_CONTENT_LENGTH,
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SECURE=True,
-    SESSION_COOKIE_SAMESITE='Strict'
-)
+# Sesje użytkowników (w pamięci)
+sessions = {}
 
-# ProxyFix dla Nginx
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-
-# CSRF signer
-csrf_signer = TimestampSigner(SECRET_KEY)
-
-@app.context_processor
-def inject_csrf():
-    """Dodaje token CSRF do wszystkich szablonów"""
-    return {'csrf_token': generate_csrf_token()}
-
-def generate_csrf_token() -> str:
+def generate_csrf_token():
     """Generuje token CSRF"""
-    return csrf_signer.sign('csrf').decode('utf-8')
+    timestamp = str(int(time.time()))
+    message = f"{timestamp}:{SECRET_KEY}"
+    signature = hmac.new(SECRET_KEY.encode(), message.encode(), hashlib.sha256).hexdigest()
+    return f"{timestamp}.{signature}"
 
-def validate_csrf_token(token: str) -> bool:
-    """Waliduje token CSRF"""
-    if not token:
-        return False
+def verify_csrf_token(token):
+    """Weryfikuje token CSRF"""
     try:
-        csrf_signer.unsign(token, max_age=3600)
-        return True
-    except (BadSignature, SignatureExpired):
+        timestamp_str, signature = token.split('.', 1)
+        timestamp = int(timestamp_str)
+        
+        # Token ważny przez 1 godzinę
+        if time.time() - timestamp > 3600:
+            return False
+            
+        message = f"{timestamp}:{SECRET_KEY}"
+        expected_signature = hmac.new(SECRET_KEY.encode(), message.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(signature, expected_signature)
+    except:
         return False
 
-def is_authenticated() -> bool:
-    """Sprawdza czy użytkownik jest zalogowany"""
-    return session.get('user') == 'admin'
-
-def login_required(f):
-    """Dekorator wymuszający autoryzację"""
-    def decorated_function(*args, **kwargs):
-        if not is_authenticated():
-            abort(401)
-        return f(*args, **kwargs)
-    decorated_function.__name__ = f.__name__
-    return decorated_function
-
-def safe_path(rel_path: str) -> Optional[Path]:
-    """Bezpiecznie waliduje ścieżkę"""
-    if not rel_path or rel_path.startswith('/'):
+def safe_path(rel_path):
+    """Bezpiecznie sprawdza ścieżkę"""
+    if not rel_path or '..' in rel_path:
         return None
     
-    try:
-        abs_path = (upload_path / rel_path).resolve()
-        if not str(abs_path).startswith(str(upload_path) + os.sep):
-            return None
-        if abs_path.is_symlink():
-            return None
-        return abs_path
-    except (RuntimeError, ValueError):
+    abs_path = (upload_path / rel_path).resolve()
+    upload_abs = upload_path.resolve()
+    
+    # Sprawdź czy ścieżka jest w UPLOAD_ROOT
+    if not str(abs_path).startswith(str(upload_abs) + os.sep):
         return None
+    
+    # Sprawdź czy to nie jest symlink
+    if abs_path.is_symlink():
+        return None
+        
+    return abs_path
 
-def format_size(size_bytes: int) -> str:
-    """Formatuje rozmiar pliku"""
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.1f} TB"
+def create_session():
+    """Tworzy nową sesję"""
+    session_id = base64.b64encode(os.urandom(32)).decode()
+    sessions[session_id] = {
+        'user': 'admin',
+        'csrf_token': generate_csrf_token(),
+        'created': time.time()
+    }
+    return session_id
 
-# HTML template z wbudowanym CSS
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="pl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% if title %}{{ title }} - {% endif %}File Uploader</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #1a1a1a; color: #e0e0e0; line-height: 1.6;
-        }
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-        .header { text-align: center; margin-bottom: 30px; }
-        .header h1 { color: #4CAF50; font-size: 2.5em; margin-bottom: 10px; }
-        .login-form { 
-            max-width: 400px; margin: 100px auto; text-align: center;
-            background: #2d2d2d; padding: 40px; border-radius: 10px;
-        }
-        .form-group { margin-bottom: 20px; }
-        input[type="password"] { 
-            width: 100%; padding: 12px; border: none; border-radius: 5px;
-            background: #404040; color: #e0e0e0; font-size: 16px;
-        }
-        .btn { 
-            background: #4CAF50; color: white; padding: 12px 24px;
-            border: none; border-radius: 5px; cursor: pointer; font-size: 16px;
-            transition: background 0.3s;
-        }
-        .btn:hover { background: #45a049; }
-        .btn-danger { background: #f44336; }
-        .btn-danger:hover { background: #da190b; }
-        .upload-zone { 
-            border: 2px dashed #4CAF50; border-radius: 10px; padding: 40px;
-            text-align: center; margin-bottom: 30px; transition: all 0.3s;
-        }
-        .upload-zone.dragover { background: #2d2d2d; border-color: #45a049; }
-        .file-input { display: none; }
-        .file-list { 
-            background: #2d2d2d; border-radius: 10px; padding: 20px;
-            margin-bottom: 30px;
-        }
-        .file-item { 
-            display: flex; justify-content: space-between; align-items: center;
-            padding: 15px; border-bottom: 1px solid #404040;
-        }
-        .file-item:last-child { border-bottom: none; }
-        .file-info { flex: 1; }
-        .file-name { font-weight: bold; margin-bottom: 5px; }
-        .file-meta { color: #888; font-size: 0.9em; }
-        .file-actions { display: flex; gap: 10px; }
-        .progress-bar { 
-            width: 100%; height: 20px; background: #404040; border-radius: 10px;
-            overflow: hidden; margin-top: 10px;
-        }
-        .progress-fill { 
-            height: 100%; background: #4CAF50; transition: width 0.3s;
-        }
-        .flash { 
-            padding: 15px; margin-bottom: 20px; border-radius: 5px;
-            background: #4CAF50; color: white;
-        }
-        .flash.error { background: #f44336; }
-        .logout-form { text-align: right; margin-bottom: 20px; }
-        .logout-form .btn { padding: 8px 16px; font-size: 14px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        {% if session.user %}
-            <div class="logout-form">
-                <form method="POST" action="{{ url_for('logout') }}" style="display: inline;">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <button type="submit" class="btn btn-danger">Wyloguj</button>
+def get_session(cookie_header):
+    """Pobiera sesję z cookie"""
+    if not cookie_header:
+        return None
+    
+    for cookie in cookie_header.split(';'):
+        if 'session=' in cookie:
+            session_id = cookie.split('=')[1].strip()
+            if session_id in sessions:
+                session = sessions[session_id]
+                # Sesja ważna przez 24 godziny
+                if time.time() - session['created'] < 86400:
+                    return session
+                else:
+                    del sessions[session_id]
+    return None
+
+def set_cookie_headers(session_id):
+    """Ustawia nagłówki cookie"""
+    return [
+        ('Set-Cookie', f'session={session_id}; HttpOnly; Secure; SameSite=Strict; Path=/'),
+    ]
+
+class FileUploadHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        """Obsługuje żądania GET"""
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
+        
+        # Sprawdź sesję
+        session = get_session(self.headers.get('Cookie'))
+        
+        if path == '/login':
+            if session:
+                self.send_response(302)
+                self.send_header('Location', '/')
+                self.end_headers()
+                return
+            self.send_login_page()
+            return
+            
+        if path == '/':
+            if not session:
+                self.send_response(302)
+                self.send_header('Location', '/login')
+                self.end_headers()
+                return
+            self.send_main_page(session)
+            return
+            
+        if path.startswith('/download/'):
+            if not session:
+                self.send_response(401)
+                self.end_headers()
+                return
+            rel_path = path[10:]  # Usuń '/download/'
+            self.send_file(rel_path)
+            return
+            
+        # 404 dla nieznanych ścieżek
+        self.send_response(404)
+        self.end_headers()
+        self.wfile.write(b'404 Not Found')
+    
+    def do_POST(self):
+        """Obsługuje żądania POST"""
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
+        
+        # Pobierz dane POST
+        content_length = int(self.headers.get('Content-Length', 0))
+        if content_length > MAX_CONTENT_LENGTH:
+            self.send_response(413)
+            self.end_headers()
+            self.wfile.write(b'File too large')
+            return
+            
+        post_data = self.rfile.read(content_length)
+        
+        if path == '/login':
+            self.handle_login(post_data)
+            return
+            
+        if path == '/upload':
+            session = get_session(self.headers.get('Cookie'))
+            if not session:
+                self.send_response(401)
+                self.end_headers()
+                return
+            self.handle_upload(post_data, session)
+            return
+            
+        if path == '/delete':
+            session = get_session(self.headers.get('Cookie'))
+            if not session:
+                self.send_response(401)
+                self.end_headers()
+                return
+            self.handle_delete(post_data, session)
+            return
+            
+        if path == '/logout':
+            session = get_session(self.headers.get('Cookie'))
+            if session:
+                # Usuń sesję
+                for session_id, sess in list(sessions.items()):
+                    if sess == session:
+                        del sessions[session_id]
+                        break
+            self.send_response(302)
+            self.send_header('Location', '/login')
+            self.end_headers()
+            return
+    
+    def send_login_page(self):
+        """Wysyła stronę logowania"""
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>Logowanie - File Upload</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; background: #1a1a1a; color: #fff; margin: 0; padding: 20px; }}
+                .container {{ max-width: 400px; margin: 100px auto; background: #2a2a2a; padding: 30px; border-radius: 10px; }}
+                h1 {{ text-align: center; margin-bottom: 30px; }}
+                input[type="password"] {{ width: 100%; padding: 12px; margin: 10px 0; border: none; border-radius: 5px; background: #333; color: #fff; }}
+                button {{ width: 100%; padding: 12px; background: #007acc; color: white; border: none; border-radius: 5px; cursor: pointer; }}
+                button:hover {{ background: #005a9e; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🔐 Logowanie</h1>
+                <form method="POST" action="/login">
+                    <input type="password" name="password" placeholder="Hasło administratora" required>
+                    <button type="submit">Zaloguj</button>
                 </form>
             </div>
-            
-            <div class="header">
-                <h1>📁 File Uploader</h1>
-                <p>Zarządzaj plikami bezpiecznie</p>
-            </div>
-
-            {% with messages = get_flashed_messages() %}
-                {% if messages %}
-                    {% for message in messages %}
-                        <div class="flash">{{ message }}</div>
-                    {% endfor %}
-                {% endif %}
-            {% endwith %}
-
-            <div class="upload-zone" id="uploadZone">
-                <h3>📤 Przeciągnij pliki tutaj lub kliknij</h3>
-                <p>lub</p>
-                <input type="file" id="fileInput" class="file-input" multiple>
-                <button class="btn" onclick="document.getElementById('fileInput').click()">
-                    Wybierz pliki
-                </button>
-            </div>
-
-            <div class="file-list">
-                <h3>📋 Lista plików</h3>
-                {% if files %}
-                    {% for file in files %}
-                        <div class="file-item">
-                            <div class="file-info">
-                                <div class="file-name">{{ file.name }}</div>
-                                <div class="file-meta">
-                                    {{ file.size_human }} • 
-                                    {{ file.mtime.strftime('%Y-%m-%d %H:%M:%S') }}
-                                </div>
-                            </div>
-                            <div class="file-actions">
-                                <a href="{{ url_for('download', rel=file.name) }}" class="btn">
-                                    📥 Pobierz
-                                </a>
-                                <form method="POST" action="{{ url_for('delete') }}" style="display: inline;">
-                                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                                    <input type="hidden" name="path" value="{{ file.name }}">
-                                    <button type="submit" class="btn btn-danger" 
-                                            onclick="return confirm('Usunąć plik {{ file.name }}?')">
-                                        🗑️ Usuń
-                                    </button>
-                                </form>
-                            </div>
-                        </div>
-                    {% endfor %}
-                {% else %}
-                    <p style="text-align: center; color: #888; padding: 20px;">
-                        Brak plików do wyświetlenia
-                    </p>
-                {% endif %}
-            </div>
-        {% else %}
-            <div class="login-form">
-                <h2>🔐 Logowanie</h2>
-                <form method="POST">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <div class="form-group">
-                        <input type="password" name="password" placeholder="Hasło" required>
-                    </div>
-                    <button type="submit" class="btn">Zaloguj</button>
-                </form>
-            </div>
-        {% endif %}
-    </div>
-
-    <script>
-        // Drag & Drop
-        const uploadZone = document.getElementById('uploadZone');
-        const fileInput = document.getElementById('fileInput');
-        
-        if (uploadZone && fileInput) {
-            uploadZone.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                uploadZone.classList.add('dragover');
-            });
-            
-            uploadZone.addEventListener('dragleave', () => {
-                uploadZone.classList.remove('dragover');
-            });
-            
-            uploadZone.addEventListener('drop', (e) => {
-                e.preventDefault();
-                uploadZone.classList.remove('dragover');
-                const files = e.dataTransfer.files;
-                uploadFiles(files);
-            });
-            
-            fileInput.addEventListener('change', (e) => {
-                uploadFiles(e.target.files);
-            });
-        }
-        
-        function uploadFiles(files) {
-            Array.from(files).forEach(file => {
-                const formData = new FormData();
-                formData.append('files', file);
-                formData.append('csrf_token', '{{ csrf_token }}');
-                
-                const xhr = new XMLHttpRequest();
-                xhr.open('POST', '{{ url_for("upload") }}');
-                
-                xhr.onload = function() {
-                    if (xhr.status === 200) {
-                        location.reload();
-                    } else {
-                        alert('Błąd uploadu: ' + xhr.responseText);
-                    }
-                };
-                
-                xhr.send(formData);
-            });
-        }
-    </script>
-</body>
-</html>
-"""
-
-@app.route('/')
-@login_required
-def index():
-    """Główna strona"""
-    files = []
-    try:
+        </body>
+        </html>
+        """
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(html.encode('utf-8'))
+    
+    def send_main_page(self, session):
+        """Wysyła główną stronę"""
+        # Lista plików
+        files = []
         for file_path in upload_path.iterdir():
             if file_path.is_file():
                 stat = file_path.stat()
                 files.append({
                     'name': file_path.name,
                     'size': stat.st_size,
-                    'mtime': datetime.fromtimestamp(stat.st_mtime),
-                    'size_human': format_size(stat.st_size)
+                    'mtime': stat.st_mtime
                 })
+        
+        # Sortuj po dacie modyfikacji (najnowsze pierwsze)
         files.sort(key=lambda x: x['mtime'], reverse=True)
-    except OSError:
-        flash('Błąd podczas odczytu listy plików', 'error')
-    
-    return render_template_string(HTML_TEMPLATE, files=files, title="Główna")
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    """Logowanie"""
-    if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Nieprawidłowy token CSRF', 'error')
-            return render_template_string(HTML_TEMPLATE, title="Logowanie"), 400
         
-        password = request.form.get('password')
-        if password == ADMIN_PASSWORD:
-            session['user'] = 'admin'
-            flash('Zalogowano pomyślnie', 'success')
-            return redirect(url_for('index'))
-        else:
-            flash('Nieprawidłowe hasło', 'error')
-            return render_template_string(HTML_TEMPLATE, title="Logowanie"), 401
-    
-    return render_template_string(HTML_TEMPLATE, title="Logowanie")
-
-@app.route('/logout', methods=['POST'])
-@login_required
-def logout():
-    """Wylogowanie"""
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Nieprawidłowy token CSRF', 'error')
-        return redirect(url_for('index')), 400
-    
-    session.clear()
-    flash('Wylogowano pomyślnie', 'success')
-    return redirect(url_for('login'))
-
-@app.route('/upload', methods=['POST'])
-@login_required
-def upload():
-    """Upload plików"""
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        return jsonify({'error': 'Nieprawidłowy token CSRF'}), 400
-    
-    if 'files' not in request.files:
-        return jsonify({'error': 'Brak plików'}), 400
-    
-    uploaded_files = request.files.getlist('files')
-    results = []
-    
-    for file in uploaded_files:
-        if file.filename == '':
-            results.append({'filename': 'unknown', 'status': 'error', 'message': 'Pusta nazwa pliku'})
-            continue
+        files_html = ""
+        for file_info in files:
+            size_mb = file_info['size'] / (1024 * 1024)
+            mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(file_info['mtime']))
+            files_html += f"""
+            <tr>
+                <td>{file_info['name']}</td>
+                <td>{size_mb:.1f} MB</td>
+                <td>{mtime}</td>
+                <td>
+                    <a href="/download/{file_info['name']}" class="btn btn-download">📥 Pobierz</a>
+                    <form method="POST" action="/delete" style="display: inline;">
+                        <input type="hidden" name="path" value="{file_info['name']}">
+                        <button type="submit" class="btn btn-delete" onclick="return confirm('Usunąć plik?')">🗑️ Usuń</button>
+                    </form>
+                </td>
+            </tr>
+            """
         
-        filename = secure_filename(file.filename)
-        if not filename:
-            results.append({'filename': file.filename, 'status': 'error', 'message': 'Nieprawidłowa nazwa pliku'})
-            continue
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>File Upload - Panel administratora</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; background: #1a1a1a; color: #fff; margin: 0; padding: 20px; }}
+                .container {{ max-width: 1200px; margin: 0 auto; }}
+                .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }}
+                .upload-area {{ border: 2px dashed #007acc; padding: 40px; text-align: center; border-radius: 10px; margin-bottom: 30px; }}
+                .upload-area.dragover {{ background: #007acc20; border-color: #00aaff; }}
+                .file-input {{ display: none; }}
+                .progress {{ width: 100%; height: 20px; background: #333; border-radius: 10px; overflow: hidden; margin: 10px 0; }}
+                .progress-bar {{ height: 100%; background: #007acc; width: 0%; transition: width 0.3s; }}
+                table {{ width: 100%; border-collapse: collapse; background: #2a2a2a; border-radius: 10px; overflow: hidden; }}
+                th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #333; }}
+                th {{ background: #007acc; }}
+                .btn {{ padding: 8px 16px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; margin: 2px; }}
+                .btn-download {{ background: #28a745; color: white; }}
+                .btn-delete {{ background: #dc3545; color: white; }}
+                .btn-logout {{ background: #6c757d; color: white; }}
+                .btn:hover {{ opacity: 0.8; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>📁 Panel administratora</h1>
+                    <form method="POST" action="/logout" style="display: inline;">
+                        <button type="submit" class="btn btn-logout">🚪 Wyloguj</button>
+                    </form>
+                </div>
+                
+                <div class="upload-area" id="uploadArea">
+                    <h3>📤 Przeciągnij pliki tutaj lub kliknij aby wybrać</h3>
+                    <input type="file" id="fileInput" class="file-input" multiple>
+                    <div class="progress" id="progress" style="display: none;">
+                        <div class="progress-bar" id="progressBar"></div>
+                    </div>
+                </div>
+                
+                <h2>📋 Lista plików</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Nazwa pliku</th>
+                            <th>Rozmiar</th>
+                            <th>Data modyfikacji</th>
+                            <th>Akcje</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {files_html}
+                    </tbody>
+                </table>
+            </div>
+            
+            <script>
+                const uploadArea = document.getElementById('uploadArea');
+                const fileInput = document.getElementById('fileInput');
+                const progress = document.getElementById('progress');
+                const progressBar = document.getElementById('progressBar');
+                
+                uploadArea.addEventListener('click', () => {{
+                    fileInput.click();
+                }});
+                
+                uploadArea.addEventListener('dragover', (e) => {{
+                    e.preventDefault();
+                    uploadArea.classList.add('dragover');
+                }});
+                
+                uploadArea.addEventListener('dragleave', () => {{
+                    uploadArea.classList.remove('dragover');
+                }});
+                
+                uploadArea.addEventListener('drop', (e) => {{
+                    e.preventDefault();
+                    uploadArea.classList.remove('dragover');
+                    const files = e.dataTransfer.files;
+                    uploadFiles(files);
+                }});
+                
+                fileInput.addEventListener('change', (e) => {{
+                    uploadFiles(e.target.files);
+                }});
+                
+                function uploadFiles(files) {{
+                    if (files.length === 0) return;
+                    
+                    progress.style.display = 'block';
+                    progressBar.style.width = '0%';
+                    
+                    const formData = new FormData();
+                    for (let file of files) {{
+                        formData.append('files', file);
+                    }}
+                    
+                    const xhr = new XMLHttpRequest();
+                    xhr.open('POST', '/upload');
+                    
+                    xhr.upload.addEventListener('progress', (e) => {{
+                        if (e.lengthComputable) {{
+                            const percent = (e.loaded / e.total) * 100;
+                            progressBar.style.width = percent + '%';
+                        }}
+                    }});
+                    
+                    xhr.addEventListener('load', () => {{
+                        if (xhr.status === 200) {{
+                            setTimeout(() => location.reload(), 1000);
+                        }} else {{
+                            alert('Błąd uploadu: ' + xhr.responseText);
+                        }}
+                        progress.style.display = 'none';
+                    }});
+                    
+                    xhr.send(formData);
+                }}
+            </script>
+        </body>
+        </html>
+        """
+        
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(html.encode('utf-8'))
+    
+    def handle_login(self, post_data):
+        """Obsługuje logowanie"""
+        try:
+            data = parse_qs(post_data.decode())
+            password = data.get('password', [''])[0]
+            
+            if password == ADMIN_PASSWORD:
+                session_id = create_session()
+                self.send_response(302)
+                self.send_header('Location', '/')
+                for header in set_cookie_headers(session_id):
+                    self.send_header(*header)
+                self.end_headers()
+            else:
+                self.send_response(302)
+                self.send_header('Location', '/login')
+                self.end_headers()
+        except:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'Bad request')
+    
+    def handle_upload(self, post_data, session):
+        """Obsługuje upload plików"""
+        try:
+            # Prosty parser multipart/form-data
+            boundary = None
+            for line in self.headers.get('Content-Type', '').split(';'):
+                if 'boundary=' in line:
+                    boundary = line.split('=')[1].strip()
+                    break
+            
+            if not boundary:
+                self.send_response(400)
+                self.end_headers()
+                return
+            
+            # Parsuj dane multipart
+            parts = post_data.split(b'--' + boundary.encode())
+            uploaded_files = []
+            
+            for part in parts:
+                if b'Content-Disposition: form-data' in part:
+                    # Wyciągnij nazwę pliku
+                    lines = part.split(b'\r\n')
+                    filename = None
+                    for line in lines:
+                        if b'filename=' in line:
+                            filename = line.split(b'filename=')[1].strip(b'"')
+                            break
+                    
+                    if filename:
+                        # Wyciągnij zawartość pliku
+                        content_start = part.find(b'\r\n\r\n') + 4
+                        content_end = part.rfind(b'\r\n')
+                        if content_end > content_start:
+                            file_content = part[content_start:content_end]
+                            
+                            # Zapisz plik
+                            safe_filename = "".join(c for c in filename.decode() if c.isalnum() or c in '.-_')
+                            if safe_filename:
+                                file_path = upload_path / safe_filename
+                                
+                                # Zapis atomowy
+                                temp_path = upload_path / f"{safe_filename}.part"
+                                with open(temp_path, 'wb') as f:
+                                    f.write(file_content)
+                                os.replace(temp_path, file_path)
+                                
+                                uploaded_files.append(safe_filename)
+            
+            # Odpowiedź
+            response = {'uploaded': uploaded_files}
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode())
+            
+        except Exception as e:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(f'Upload error: {str(e)}'.encode())
+    
+    def handle_delete(self, post_data, session):
+        """Obsługuje usuwanie plików"""
+        try:
+            data = parse_qs(post_data.decode())
+            rel_path = data.get('path', [''])[0]
+            
+            if not rel_path:
+                self.send_response(400)
+                self.end_headers()
+                return
+            
+            file_path = safe_path(rel_path)
+            if not file_path or not file_path.is_file():
+                self.send_response(400)
+                self.end_headers()
+                return
+            
+            # Usuń plik
+            file_path.unlink()
+            
+            self.send_response(302)
+            self.send_header('Location', '/')
+            self.end_headers()
+            
+        except Exception as e:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(f'Delete error: {str(e)}'.encode())
+    
+    def send_file(self, rel_path):
+        """Wysyła plik do pobrania"""
+        file_path = safe_path(rel_path)
+        if not file_path or not file_path.is_file():
+            self.send_response(404)
+            self.end_headers()
+            return
         
         try:
-            # Zapis atomowy
-            temp_path = upload_path / f"{filename}.part"
-            final_path = upload_path / filename
+            with open(file_path, 'rb') as f:
+                content = f.read()
             
-            file.save(temp_path)
-            os.replace(temp_path, final_path)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Disposition', f'attachment; filename="{rel_path}"')
+            self.send_header('Content-Length', str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
             
-            results.append({'filename': filename, 'status': 'success'})
         except Exception as e:
-            results.append({'filename': filename, 'status': 'error', 'message': str(e)})
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(f'Download error: {str(e)}'.encode())
     
-    return jsonify({'results': results})
+    def log_message(self, format, *args):
+        """Wyłącza logowanie"""
+        pass
 
-@app.route('/download/<path:rel>')
-@login_required
-def download(rel):
-    """Pobieranie pliku"""
-    file_path = safe_path(rel)
-    if not file_path or not file_path.is_file():
-        abort(404)
-    
-    return send_file(
-        file_path,
-        as_attachment=True,
-        download_name=file_path.name
-    )
-
-@app.route('/delete', methods=['POST'])
-@login_required
-def delete():
-    """Usuwanie pliku"""
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Nieprawidłowy token CSRF', 'error')
-        return redirect(url_for('index')), 400
-    
-    rel_path = request.form.get('path')
-    if not rel_path:
-        flash('Brak ścieżki pliku', 'error')
-        return redirect(url_for('index')), 400
-    
-    file_path = safe_path(rel_path)
-    if not file_path or not file_path.is_file():
-        flash('Nieprawidłowa ścieżka pliku', 'error')
-        return redirect(url_for('index')), 400
+def run_server():
+    """Uruchamia serwer"""
+    server_address = ('', 80)
+    httpd = HTTPServer(server_address, FileUploadHandler)
+    print(f"🚀 Serwer uruchomiony na porcie 80")
+    print(f"📁 Katalog upload: {upload_path.absolute()}")
+    print(f"🔐 Hasło: {ADMIN_PASSWORD}")
+    print(f"🌐 Otwórz: http://localhost")
+    print("⏹️  Zatrzymaj: Ctrl+C")
     
     try:
-        file_path.unlink()
-        flash(f'Plik {rel_path} został usunięty', 'success')
-    except OSError:
-        flash(f'Błąd podczas usuwania pliku {rel_path}', 'error')
-    
-    return redirect(url_for('index'))
-
-@app.errorhandler(400)
-def bad_request(error):
-    return render_template_string(HTML_TEMPLATE, title="Błąd 400"), 400
-
-@app.errorhandler(401)
-def unauthorized(error):
-    return redirect(url_for('login'))
-
-@app.errorhandler(404)
-def not_found(error):
-    return render_template_string(HTML_TEMPLATE, title="Błąd 404"), 404
-
-@app.errorhandler(413)
-def too_large(error):
-    flash('Plik jest za duży', 'error')
-    return redirect(url_for('index')), 413
-
-@app.errorhandler(500)
-def internal_error(error):
-    flash('Błąd wewnętrzny serwera', 'error')
-    return redirect(url_for('index')), 500
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n🛑 Serwer zatrzymany")
+        httpd.server_close()
 
 if __name__ == '__main__':
-    app.run(debug=False, host='0.0.0.0', port=8080)
+    run_server()
