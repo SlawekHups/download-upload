@@ -291,6 +291,6 @@ curl -X POST "http://localhost:5000/delete" \
 
 MIT License
 
-## Autor
+## Autor hUps
 
 File Uploader - Bezpieczne narzędzie do zarządzania plikami
